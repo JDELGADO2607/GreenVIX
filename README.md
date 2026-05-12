@@ -1,740 +1,875 @@
-# GreenVIX Calibration — Technical Documentation
+# GJR-GARCH + GRU Synthetic VIX Pipeline
+## Technical Documentation — v2 (Walk-Forward)
 
-**Heston-Nandi (2000) Affine GARCH · Joint SPX/VIX MLE · ESG Synthetic VIX**
+> **File:** `gjr_garch_gru_synthetic_vix.R`  
+> **Language:** R (≥ 4.2)  
+> **Last updated:** 2026
 
 ---
 
 ## Table of Contents
 
-1. [Project Overview](#1-project-overview)
-2. [Repository Structure](#2-repository-structure)
-3. [Mathematical Framework](#3-mathematical-framework)
-   - 3.1 [Physical Measure (P) Dynamics](#31-physical-measure-p-dynamics)
-   - 3.2 [Risk-Neutral Measure (Q) Transformation](#32-risk-neutral-measure-q-transformation)
-   - 3.3 [Affine Variance Recursion for VIX](#33-affine-variance-recursion-for-vix)
-   - 3.4 [Characteristic Function](#34-characteristic-function)
-   - 3.5 [Gil-Pelaez Option Pricing Inversion](#35-gil-pelaez-option-pricing-inversion)
-   - 3.6 [CBOE Variance Swap Formula](#36-cboe-variance-swap-formula)
-   - 3.7 [Dual-Maturity VIX Interpolation](#37-dual-maturity-vix-interpolation)
-4. [C++ Pricer — `hn_pricer.cpp`](#4-c-pricer--hn_pricercpp)
-   - 4.1 [Dependencies and Compilation](#41-dependencies-and-compilation)
-   - 4.2 [Function: `hn_call_price`](#42-function-hn_call_price)
-   - 4.3 [Function: `hn_put_price`](#43-function-hn_put_price)
-   - 4.4 [Function: `hn_option_strip`](#44-function-hn_option_strip)
-   - 4.5 [Numerical Integration Design](#45-numerical-integration-design)
-   - 4.6 [Characteristic Function Recursion](#46-characteristic-function-recursion)
-5. [R Script — `main.R`](#5-r-script--mainr)
-   - 5.1 [Section 0 — Packages](#51-section-0--packages)
-   - 5.2 [Section 1 — Settings](#52-section-1--settings)
-   - 5.3 [Section 2 — Data Loading](#53-section-2--data-loading)
-   - 5.4 [Section 3 — Affine Coefficients](#54-section-3--affine-coefficients)
-   - 5.5 [Section 4 — Joint NLL Function](#55-section-4--joint-nll-function)
-   - 5.6 [Section 5 — SPX/VIX MLE](#56-section-5--spxvix-mle)
-   - 5.7 [Section 6 — SPX Diagnostic Plots](#57-section-6--spx-diagnostic-plots)
-   - 5.8 [Section 7 — ESG Physical MLE](#58-section-7--esg-physical-mle)
-   - 5.9 [Section 8 — ESG P-Measure Filter](#59-section-8--esg-p-measure-filter)
-   - 5.10 [Section 9 — CBOE Variance Formula](#510-section-9--cboe-variance-formula)
-   - 5.11 [Section 10 — Strike Grid Builder](#511-section-10--strike-grid-builder)
-   - 5.12 [Section 11 — Parallelised Daily VIX Loop](#512-section-11--parallelised-daily-vix-loop)
-   - 5.13 [Section 12 — ESG Output](#513-section-12--esg-output)
-6. [Parameter Reference](#6-parameter-reference)
-7. [Calibration Constraints](#7-calibration-constraints)
-8. [Data Requirements](#8-data-requirements)
-9. [Outputs](#9-outputs)
-10. [Design Decisions and Known Limitations](#10-design-decisions-and-known-limitations)
-11. [References](#11-references)
+1. [Overview](#1-overview)
+2. [Academic Basis](#2-academic-basis)
+3. [Architecture Diagram](#3-architecture-diagram)
+4. [Dependencies](#4-dependencies)
+5. [Configuration Reference](#5-configuration-reference)
+6. [Data Requirements](#6-data-requirements)
+7. [Function Reference](#7-function-reference)
+8. [Pipeline Steps](#8-pipeline-steps)
+9. [Walk-Forward Validation Protocol](#9-walk-forward-validation-protocol)
+10. [Transfer Learning Mechanism](#10-transfer-learning-mechanism)
+11. [Output Files](#11-output-files)
+12. [Performance Metrics](#12-performance-metrics)
+13. [Methodological Optimizations (v1 → v2)](#13-methodological-optimizations-v1--v2)
+14. [Error Handling & Fallback Chains](#14-error-handling--fallback-chains)
+15. [Extending the Pipeline](#15-extending-the-pipeline)
+16. [Known Limitations](#16-known-limitations)
+17. [References](#17-references)
 
 ---
 
-## 1. Project Overview
+## 1. Overview
 
-This codebase implements a full quantitative pipeline for constructing a **synthetic volatility index (GreenVIX)** for a custom ESG equity index that has no traded options. The pipeline has three stages:
+This pipeline constructs a **synthetic VIX** (implied volatility index) for an illiquid ESG index by exploiting the *universal volatility formation mechanism* — the empirical finding that the non-linear mapping from physical conditional variance to risk-neutral implied volatility is asset-invariant and therefore transferable.
 
-| Stage | Description | Key Output |
-|---|---|---|
-| **SPX/VIX Joint MLE** | Calibrate HN-GARCH parameters against both SPX log-returns and observed VIX levels simultaneously | `{ω, α, β, γ, λ, σ_v}` SPX |
-| **ESG Physical MLE** | Calibrate ESG variance dynamics from ESG log-returns alone | `{ω, α, β, γ}` ESG |
-| **Synthetic VIX** | Price a dense theoretical option grid under the Q-measure using the HN closed form; apply the CBOE variance swap formula | `vix_esg` time series |
+The method proceeds in two stages:
 
-The core insight enabling Stage 3 is that the **variance risk premium** `λ` (which bridges P and Q) is not identifiable from ESG returns alone but is shared with the broad market. We borrow `λ_SPX` from Stage 1 and apply it to the ESG index via the risk-neutral leverage transformation `γ*_ESG = γ_ESG + λ_SPX + 0.5`.
+**Stage 1 — Source domain (S&P 500):** A GJR-GARCH(1,1) model extracts daily physical conditional variance from SPX log-returns. A stacked GRU neural network then learns the non-linear mapping from `[r_spx_t, f(h_spx_t)]` to `VIX_t` using walk-forward cross-validation to ensure regime robustness.
+
+**Stage 2 — Target domain (ESG index):** An identical GJR-GARCH specification is fitted to the ESG log-returns. The ESG features are normalised using the SPX scalers (cross-domain normalisation), then fed into the pre-trained GRU to produce the synthetic VIX time series.
+
+### What this pipeline is NOT
+
+- It does not price individual options or compute a term structure.
+- It does not assume the ESG index has liquid traded options.
+- It does not guarantee arbitrage-free implied volatility surfaces.
+- It is not a Shiny app or interactive dashboard.
 
 ---
 
-## 2. Repository Structure
+## 2. Academic Basis
 
-```
-.
-├── hn_pricer.cpp                  # Rcpp C++ option pricer (Gil-Pelaez inversion)
-├── main.R                         # Full calibration pipeline
-├── hn_garch_spx_results.rds       # SPX/VIX MLE output (generated)
-├── hn_garch_esg_results.rds       # ESG calibration output (generated)
-├── esg_synthetic_vix.csv          # Daily GreenVIX time series (generated)
-├── hn_garch_spx_diagnostics.png   # SPX fit diagnostic plots (generated)
-└── hn_garch_esg_diagnostics.png   # ESG volatility plots (generated)
-```
-
-**Input required:** a single Excel workbook with sheet `"Synthetic"` containing columns:
-
-| Column | Description |
+| Concept | Reference |
 |---|---|
-| `Date` | Trading dates |
-| `SPX` | S&P 500 price index levels |
-| `VIX` | CBOE VIX index levels (raw, e.g. `18.5`) |
-| `Price (Adjusted BESG)` | ESG index adjusted price levels |
-
----
-
-## 3. Mathematical Framework
-
-### 3.1 Physical Measure (P) Dynamics
-
-The **Heston-Nandi (2000) GARCH** model specifies the following discrete-time system under the physical measure P:
-
-**Return equation:**
-
-$$r_t \equiv \ln\left(\frac{S_t}{S_{t-1}}\right) = \lambda h_t + \sqrt{h_t}\, z_t, \qquad z_t \sim \mathcal{N}(0,1) \text{ i.i.d.}$$
-
-where the daily risk-free rate is set to zero (`r = 0`) for the calibration step.
-
-**Conditional variance recursion:**
-
-$$h_t = \omega + \beta h_{t-1} + \alpha\left(z_{t-1} - \gamma\sqrt{h_{t-1}}\right)^2$$
-
-**Unconditional (stationary) variance:**
-
-$$\bar{h} = \frac{\omega + \alpha}{1 - \beta - \alpha\gamma^2}$$
-
-This is used to initialise the filter at `h_0 = h̄`.
-
-**Stationarity condition:**
-
-$$\beta + \alpha\gamma^2 < 1$$
-
-This is a hard constraint enforced during both SPX and ESG optimisation.
-
----
-
-### 3.2 Risk-Neutral Measure (Q) Transformation
-
-The risk-neutral leverage parameter is obtained by an **exact measure change** (Heston & Nandi 2000, Proposition 1):
-
-$$\gamma^* = \gamma + \lambda + \frac{1}{2}$$
-
-Under Q, the variance recursion takes the same GARCH form but with `γ` replaced by `γ*`. This is the affine property that makes the model tractable.
-
-**ESG-specific application:** because the ESG index has no traded options, `λ` cannot be identified from ESG data. We transplant the broad market premium:
-
-$$\gamma^*_{\text{ESG}} = \gamma_{\text{ESG}} + \lambda_{\text{SPX}} + 0.5$$
-
-The justification is that the variance risk premium is a **market-wide price of volatility risk**, not an asset-specific quantity. This is the identification assumption of the methodology.
-
----
-
-### 3.3 Affine Variance Recursion for VIX
-
-Because the HN-GARCH model is affine in `h_t`, the Q-measure expected future variance is linear in the current state:
-
-$$E^Q_t\left[h_{t+\tau}\right] = A(\tau) + B(\tau) \cdot h_t$$
-
-with **forward recursion** initialised at `A(0) = 0, B(0) = 1`:
-
-$$A(\tau) = A(\tau-1) + \omega \cdot B(\tau-1) + \alpha$$
-
-$$B(\tau) = \underbrace{(\beta + \alpha{\gamma^*}^2)}_{\phi_Q} \cdot B(\tau-1) + \alpha{\gamma^*}^2$$
-
-The **Q-measure persistence** is `φ_Q = β + αγ*²`. The affine recursion is only meaningful when `φ_Q < 1` (a second hard constraint).
-
-**Model-implied VIX²** (annualised, percentage-squared, CBOE units):
-
-$$\widehat{\text{VIX}}_t^2 = \frac{252}{T_H} \cdot \left(\sum_{\tau=1}^{T_H} A(\tau) + \sum_{\tau=1}^{T_H} B(\tau) \cdot h_t\right) \times 10000$$
-
-where `T_H = 22` trading days. The `× 10000` factor converts from variance in decimal² to percentage².
-
----
-
-### 3.4 Characteristic Function
-
-Under Q, the log-price `log(S_T/S_0)` has the moment-generating function:
-
-$$f(\phi) = E^Q_0\left[e^{i\phi \ln S_T}\right] = \exp\!\left(A(\phi, T) + B(\phi, T) \cdot h_0 + i\phi \ln S_0\right)$$
-
-where the **complex-valued coefficients** satisfy the backward recursion (run forward from `τ = 0` to `τ = T_days`):
-
-$$A_{\text{next}} = A + \phi r + B\omega - \frac{1}{2}\ln(1 - 2\alpha B)$$
-
-$$B_{\text{next}} = \phi(\lambda + \gamma) - \frac{1}{2}\gamma^2 + \beta B + \frac{\frac{1}{2}(\phi - \gamma)^2}{1 - 2\alpha B}$$
-
-> **Note on signs:** the recursion above uses the **physical-measure** parameterisation of the CF as presented in Heston & Nandi (2000), eq. (13). The `γ` and `λ` here are the Q-measure parameters; i.e., when called for option pricing, `gamma_star` replaces `gamma` and `lambda` plays the role of the expected return under Q (set to `r_day` in practice).
-
-The recursion is singular when `Re(1 - 2αB) ≤ 0`. The C++ implementation guards this with an early-exit check.
-
----
-
-### 3.5 Gil-Pelaez Option Pricing Inversion
-
-Call price by the **Gil-Pelaez (1951)** inversion theorem:
-
-$$C = S \cdot P_1 - K e^{-rT} \cdot P_2$$
-
-where the two risk-adjusted probabilities are recovered from the characteristic function:
-
-$$P_j = \frac{1}{2} + \frac{1}{\pi} \int_0^\infty \text{Re}\!\left[\frac{e^{-i\phi \ln K} \cdot f_j(\phi)}{i\phi}\right] d\phi$$
-
-- `f_2(φ) = f(φ)` — risk-neutral CF
-- `f_1(φ) = f(φ - i) / f(-i)` — share-measure CF (tilted by `φ → φ - i`)
-
-**Put price** via put-call parity (no additional inversion needed):
-
-$$P = C - S + K e^{-rT}$$
-
----
-
-### 3.6 CBOE Variance Swap Formula
-
-For a set of OTM strikes `{K_i}` with option prices `{Q_i}`, the CBOE variance is:
-
-$$\sigma^2 = \frac{2}{T}\sum_i \frac{\Delta K_i}{K_i^2} e^{RT} Q_i - \frac{1}{T}\left(\frac{F}{K_0} - 1\right)^2$$
-
-where:
-
-- `F = S · e^{RT}` — forward price
-- `K_0` — highest strike satisfying `K_0 ≤ F`
-- `ΔK_i` — central difference for interior strikes, one-sided at the wings:
-
-$$\Delta K_i = \begin{cases} K_2 - K_1 & i = 1 \\ K_n - K_{n-1} & i = n \\ \dfrac{K_{i+1} - K_{i-1}}{2} & \text{otherwise} \end{cases}$$
-
-**OTM selection rule:**
-
-$$Q_i = \begin{cases} \text{Put}(K_i) & K_i < K_0 \\ \frac{1}{2}\left[\text{Put}(K_0) + \text{Call}(K_0)\right] & K_i = K_0 \\ \text{Call}(K_i) & K_i > K_0 \end{cases}$$
-
-**Tail truncation (CBOE rule):** starting from each wing and scanning inward, discard all strikes once **two consecutive** option prices fall below `PRICE_FLOOR = 0.001`. This replicates the CBOE's two-consecutive-zero-bid termination rule in a theoretical (no-zero-bid) environment.
-
----
-
-### 3.7 Dual-Maturity VIX Interpolation
-
-Two option grids are constructed for each day: near-term (`T1 = 23/365`) and next-term (`T2 = 37/365`). The variances `σ²₁` and `σ²₂` are interpolated to the target horizon:
-
-$$\sigma^2_{30} = \left[T_1 \sigma^2_1 \cdot \frac{N_2 - N_{\text{target}}}{N_2 - N_1} + T_2 \sigma^2_2 \cdot \frac{N_{\text{target}} - N_1}{N_2 - N_1}\right] \cdot \frac{365}{N_{\text{target}}}$$
-
-where `N_1 = 23`, `N_2 = 37`, `N_target = 30` are calendar day counts, and `T_1`, `T_2` are the corresponding year fractions. The final GreenVIX level is:
-
-$$\text{GreenVIX}_t = 100 \cdot \sqrt{\sigma^2_{30}}$$
-
----
-
-## 4. C++ Pricer — `hn_pricer.cpp`
-
-### 4.1 Dependencies and Compilation
-
-```cpp
-#include <Rcpp.h>
-#include <complex>
-#include <cmath>
-using namespace Rcpp;
-using namespace std::complex_literals;
+| Asymmetric GARCH with leverage effect | Glosten, Jagannathan & Runkle (1993) |
+| Closed-form GARCH option pricing (H-N model) | Heston & Nandi (2000) |
+| Universal volatility formation mechanism | Ruan, Zhang & Luo (2022) |
+| Gated Recurrent Units (GRU) | Cho, van Merrienboer et al. (2014) |
+| GRU vs LSTM for financial time series | Bgates & Nouri (2021) |
+| Walk-forward validation for time series ML | Cerqueira, Torgo & Mozetič (2020) |
+
+### The Universal Volatility Mechanism Hypothesis
+
+The hypothesis states that the conditional transformation:
+
+```
+Φ : (r_t, h_t^physical) → σ_t^implied
 ```
 
-The file is compiled from R via:
+is governed by a universal non-linear mapping that can be learned from any liquid asset with observable implied volatility (here: S&P 500 / CBOE VIX) and transferred to any other asset whose physical variance dynamics are structurally similar.
+
+The key assumption is that the **functional form** of Φ is invariant across assets, even if the *scale* and *persistence* of the variance processes differ. This is operationalised by the cross-domain normalisation step described in [Section 10](#10-transfer-learning-mechanism).
+
+### GJR-GARCH as Heston-Nandi Substitute
+
+The original Heston-Nandi (2000) model is:
+
+```
+h_t = ω + α(ε_{t-1} − γ√h_{t-1})² + β·h_{t-1}
+```
+
+This is structurally equivalent to the GJR-GARCH(1,1):
+
+```
+h_t = ω + (α + γ·I_{t-1})·ε_{t-1}² + β·h_{t-1}
+```
+
+where `I_{t-1} = 1` if `ε_{t-1} < 0` (bad news). Both models capture the **leverage effect** — the empirical asymmetry whereby negative return shocks increase future variance by more than positive shocks of equal magnitude. The `fOptions` R package implementing the H-N closed form is deprecated; `rugarch::ugarchfit()` with `model = "gjrGARCH"` is the academically accepted substitute.
+
+The stationarity condition for GJR-GARCH is:
+
+```
+α + γ/2 + β < 1
+```
+
+which the script checks and reports as the *persistence* diagnostic.
+
+---
+
+## 3. Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         SOURCE DOMAIN (SPX)                         │
+│                                                                     │
+│  SPX prices ──► diff(log(.)) ──► r_spx                             │
+│                                      │                              │
+│                                      ▼                              │
+│                           GJR-GARCH(1,1) fit                        │
+│                           [tol=1e-12, delta=1e-11]                  │
+│                                      │                              │
+│                                      ▼                              │
+│                             h_spx_raw (variance)                    │
+│                                      │                              │
+│                          APPLY_VAR_TRANSFORM (sqrt)                 │
+│                                      │                              │
+│                                      ▼                              │
+│                   fh_spx = sqrt(h_spx)  [cond. SD]                  │
+│                                      │                              │
+│   r_spx ──┐                          │                              │
+│           ├──► SCALE_FIT ──► X_spx_scaled (N × 2)                  │
+│  fh_spx ──┘                          │                              │
+│                                      ▼                              │
+│                          BUILD_SEQUENCES (T=20)                     │
+│                         3-D tensor (N-T, 20, 2)                     │
+│                                      │                              │
+│              ┌───────────────────────┘                              │
+│              │                                                      │
+│              ▼           WALK-FORWARD LOOP (k folds)                │
+│     ┌────────────────┐   ┌──────────────────────────┐              │
+│     │  Fold Window k │──►│  BUILD_GRU_MODEL()        │              │
+│     │  Train: 252d   │   │  GRU(64)→Drop→GRU(32)    │              │
+│     │  Pred:   21d   │   │  →Dense(16)→Dense(1)      │              │
+│     └────────────────┘   └──────────┬───────────────┘              │
+│                                     │ OOS predictions               │
+│                                     ▼                               │
+│                          wf_results_df (all folds)                  │
+│                                                                     │
+│              ▼  FINAL GRU retrained on full SPX history             │
+│     ┌────────────────────────────────────────────────────┐         │
+│     │  final_gru  (frozen weights after training)        │         │
+│     └────────────────────────┬───────────────────────────┘         │
+└────────────────────────────────────────────────────────────────────-┘
+                                │  Transfer
+                                │  (weights frozen,
+                                │   SPX scalers applied to ESG)
+┌───────────────────────────────▼─────────────────────────────────────┐
+│                        TARGET DOMAIN (ESG)                          │
+│                                                                     │
+│  ESG prices ──► diff(log(.)) ──► log_returns                       │
+│                                        │                            │
+│                                        ▼                            │
+│                             GJR-GARCH(1,1) fit                      │
+│                             (same spec as SPX)                      │
+│                                        │                            │
+│                                        ▼                            │
+│                               h_esg_raw                             │
+│                                        │                            │
+│                            APPLY_VAR_TRANSFORM (sqrt)               │
+│                                        │                            │
+│                                        ▼                            │
+│                  fh_esg = sqrt(h_esg)                               │
+│                                        │                            │
+│  log_returns ──┐                       │                            │
+│                ├──► SPX scalers ──► X_esg_scaled (M × 2)           │
+│      fh_esg ───┘   (cross-domain normalisation)                     │
+│                                        │                            │
+│                            BUILD_SEQUENCES (T=20)                   │
+│                           3-D tensor (M-T, 20, 2)                   │
+│                                        │                            │
+│                                        ▼                            │
+│                         GRU_INFER(final_gru, X_esg)                 │
+│                                        │                            │
+│                                        ▼                            │
+│                    synth_vix = scaler_vix$inverse(...)              │
+│                                        │                            │
+│                                        ▼                            │
+│                          synthetic_vix_df  ──► CSV                  │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 4. Dependencies
+
+All packages are auto-installed if missing via the bootstrap loop at the top of the script.
+
+| Package | Version | Role |
+|---|---|---|
+| `readxl` | any | Excel ingestion of the `.xlsx` data file |
+| `rugarch` | ≥ 1.4 | GJR-GARCH and eGARCH specification and MLE fitting |
+| `keras` | ≥ 3.0 (keras3) | High-level GRU/Dense layer API and training loop |
+| `tensorflow` | ≥ 2.12 | TensorFlow backend; provides `tf$constant()` for inference |
+| `ggplot2` | ≥ 3.4 | All diagnostic and output plots |
+| `dplyr` | ≥ 1.1 | `mutate()` used in fold-shading plot data prep |
+| `tidyr` | ≥ 1.3 | `pivot_longer()` for plot reshaping (optional use) |
+| `zoo` | any | Rolling utilities and NA handling helpers |
+| `scales` | any | Axis formatting in ggplot2 |
+| `Metrics` | any | RMSE / MAE helper functions |
+| `gridExtra` | optional | Two-panel GARCH volatility plot (graceful fallback if absent) |
+
+### Python / TensorFlow backend setup
+
+Run once before first execution (in an R interactive session):
 
 ```r
-Rcpp::sourceCpp("hn_pricer.cpp")
+keras::install_keras(method = "conda", envname = "r-keras")
+tensorflow::install_tensorflow(envname = "r-keras")
 ```
 
-This triggers `clang++` (or `g++`) with the flags set by R's `Makeconf`. No manual compilation step is required. All three exported functions become available in the R session immediately after `sourceCpp`.
+On Kaggle, the TensorFlow environment is pre-installed; no manual setup is required.
 
-**Compiler requirement:** C++11 or later (required for `<complex>` and lambda syntax). `Rcpp` sets this automatically.
+### keras3 compatibility notes
 
----
+This script is written for **keras3** (the `keras` R package ≥ 3.0), which introduced breaking API changes from keras2:
 
-### 4.2 Function: `hn_call_price`
-
-```cpp
-// [[Rcpp::export]]
-double hn_call_price(double S, double K, double T, double r,
-                     double h0, double omega, double alpha,
-                     double beta, double gamma, double lambda)
-```
-
-**Parameters:**
-
-| Parameter | Type | Description |
-|---|---|---|
-| `S` | `double` | Current underlying price |
-| `K` | `double` | Strike price |
-| `T` | `double` | Time to expiry in **year fractions** (e.g. `23/365`) |
-| `r` | `double` | Continuously compounded annual risk-free rate |
-| `h0` | `double` | Current conditional variance (from P-measure filter) |
-| `omega` | `double` | Variance intercept ω |
-| `alpha` | `double` | ARCH coefficient α |
-| `beta` | `double` | GARCH coefficient β |
-| `gamma` | `double` | Leverage parameter — **pass `gamma_star` for Q-measure pricing** |
-| `lambda` | `double` | Variance risk premium λ |
-
-**Returns:** European call price as `double`. Floor at zero enforced.
-
-**Internal steps:**
-
-1. Convert `T` to trading days: `T_days = round(T × 252)`
-2. Convert annual rate to daily: `r_day = r / 252`
-3. Evaluate characteristic function at `φ` (for P2) and `φ - i` (for P1) via `log_cf` lambda
-4. Integrate with trapezoidal rule on `[dphi, upper_lim]` in 2000 steps
-5. Recover `P1`, `P2`; clamp to `[0, 1]`
-6. Return `max(S·P1 - K·exp(-rT)·P2, 0)`
-
----
-
-### 4.3 Function: `hn_put_price`
-
-```cpp
-// [[Rcpp::export]]
-double hn_put_price(double S, double K, double T, double r,
-                    double h0, double omega, double alpha,
-                    double beta, double gamma, double lambda)
-```
-
-Calls `hn_call_price` internally and applies **put-call parity**:
-
-$$P = C - S + K e^{-rT}$$
-
-No additional numerical integration. This guarantees exact put-call parity by construction and avoids a second numerical inversion.
-
----
-
-### 4.4 Function: `hn_option_strip`
-
-```cpp
-// [[Rcpp::export]]
-NumericVector hn_option_strip(NumericVector K_vec, double S, double T,
-                              double r, double h0, double omega,
-                              double alpha, double beta, double gamma,
-                              double lambda, std::string type = "call")
-```
-
-**Vectorised pricer** over a strike vector `K_vec`. Takes identical scalar parameters to `hn_call_price` plus a `type` argument (`"call"` or `"put"`).
-
-This is the primary entry point used in `main.R`. Replacing the per-strike R `for` loop with a single call to `hn_option_strip` eliminates R interpreter overhead for the entire 150-strike grid, which is the innermost loop of the computation.
-
----
-
-### 4.5 Numerical Integration Design
-
-The Gil-Pelaez integral is evaluated using the **midpoint trapezoidal rule** on a uniform grid:
-
-```cpp
-int    N     = 2000;
-double upper = 100.0;
-double dphi  = upper / N;   // step = 0.05
-```
-
-Quadrature points: `φ_j = (j - 0.5) · dphi` for `j = 1, …, 2000`.
-
-**Why these choices:**
-
-- `upper = 100` is sufficient because the HN-GARCH CF decays rapidly for `φ >> 1/√h_0`. For typical equity variance (`h_0 ~ 1e-4`), the integrand is numerically zero by `φ = 50`.
-- `N = 2000` gives step `dphi = 0.05`, which is fine enough to avoid discretisation error at the peak of the integrand near `φ ≈ 1`.
-- The midpoint rule on a uniform grid is equivalent to the trapezoidal rule and has `O(dphi²)` error per unit interval.
-
----
-
-### 4.6 Characteristic Function Recursion
-
-The `log_cf` lambda inside `hn_call_price` runs the following loop using `std::complex<double>`:
-
-```cpp
-for (int tau = 0; tau < T_days; ++tau) {
-    denom  = 1.0 - 2.0 * alpha * B;
-    A_next = A + phi*r_day + B*omega - 0.5*log(denom);
-    B_next = phi*(lambda + gamma) - 0.5*gamma*gamma
-             + beta*B + 0.5*(phi - gamma)^2 / denom;
-    A = A_next; B = B_next;
-}
-return exp(A + B*h0 + i*phi*log(S));
-```
-
-The guard `if (Re(denom) ≤ 1e-10)` triggers an early return of `NA_complex_`, which the calling integrand converts to `0.0` (contributing nothing to the integral). This prevents `log(0)` and division-by-zero without aborting the entire pricing call.
-
----
-
-## 5. R Script — `main.R`
-
-### 5.1 Section 0 — Packages
-
-```r
-required_pkgs <- c("readxl", "Rsolnp", "ggplot2", "gridExtra",
-                   "scales", "parallel", "Rcpp")
-```
-
-| Package | Role |
+| Deprecated (keras2) | Replacement (keras3) |
 |---|---|
-| `readxl` | Read `.xlsx` data file |
-| `Rsolnp` | Sequential Quadratic Programming optimiser |
-| `ggplot2` | Diagnostic plots |
-| `gridExtra` | Multi-panel plot layout |
-| `scales` | Axis formatting |
-| `parallel` | Multi-core daily VIX loop |
-| `Rcpp` | Load and compile `hn_pricer.cpp` |
-
-`Rcpp::sourceCpp("hn_pricer.cpp")` is called immediately after package loading. This compiles the C++ file and registers `hn_call_price`, `hn_put_price`, and `hn_option_strip` in the R session.
+| `keras::predict(model, X)` | `model(tf$constant(X), training=FALSE)` |
+| `model %>% compile(...)` | `keras::compile(model, ...)` |
+| `model %>% fit(...)` | `keras::fit(model, ...)` |
+| `save_model_hdf5(model, path)` | `save_model(model, path)` or Python passthrough |
 
 ---
 
-### 5.2 Section 1 — Settings
+## 5. Configuration Reference
 
-All user-facing configuration is consolidated at the top of the script:
+All hyper-parameters are declared at the top of the script in a single consolidated block for easy tuning.
+
+### GARCH parameters
 
 | Variable | Default | Description |
 |---|---|---|
-| `DATA_PATH` | *(user path)* | Path to Excel workbook |
-| `SHEET_NAME` | `"Synthetic"` | Worksheet name |
-| `VIX_HORIZON` | `22` | Trading days for affine VIX formula |
-| `VIX_WEIGHT` | `1.0` | Weight `w` on VIX leg in joint NLL |
-| `TDPY` | `252` | Trading days per year |
-| `VERBOSE` | `1` | `solnp` trace level |
-| `MAX_ITER` | `500` | SQP outer iteration limit |
-| `MAX_INNER` | `100` | BFGS inner iteration limit |
-| `N_STRIKES` | `150` | Strike grid density |
-| `M_MIN` | `0.01` | Minimum moneyness `K/S` |
-| `M_MAX` | `2.01` | Maximum moneyness `K/S` |
-| `PRICE_FLOOR` | `0.001` | Tail truncation threshold |
-| `T1_DAYS` | `23` | Near-term expiry (calendar days) |
-| `T2_DAYS` | `37` | Next-term expiry (calendar days) |
-| `TARGET_DAYS` | `30` | VIX interpolation target (calendar days) |
-| `R_F_ANNUAL` | `0` | Annual risk-free rate |
-| `N_CORES` | `detectCores() - 1` | Worker count for parallel loop |
+| `GARCH_VARIANT` | `"gjrGARCH"` | GARCH model family. Alternatives: `"eGARCH"` |
+| `GARCH_DIST` | `"sstd"` | Error distribution. `"sstd"` = skewed Student-t, handles fat tails and skewness simultaneously. Alternatives: `"std"`, `"norm"`, `"ged"` |
+| `GARCH_TOL` | `1e-12` | **[OPT-3]** Convergence tolerance for the log-likelihood gradient norm. Tighter than rugarch default (`1e-8`) to prevent premature convergence on flat likelihood surfaces near high-persistence regimes. |
+| `GARCH_DELTA` | `1e-11` | **[OPT-3]** Finite-difference step for numerical Hessian approximation used in standard error computation. |
+
+### Variance feature transform
+
+| Variable | Default | Options | Description |
+|---|---|---|---|
+| `VAR_TRANSFORM` | `"sqrt"` | `"sqrt"`, `"log"`, `"none"` | **[OPT-2]** Transformation applied to raw conditional variance `h_t` before Min-Max scaling. `"sqrt"` = conditional SD. `"log"` = log-variance. `"none"` = raw (not recommended for neural networks). |
+
+### Sequence parameters
+
+| Variable | Default | Description |
+|---|---|---|
+| `TIMESTEPS` | `20L` | Lookback window length in trading days (~1 calendar month). Input tensor shape becomes `(samples, 20, 2)`. |
+| `N_FEATURES` | `2L` | Number of input features per timestep: `[r_t, f(h_t)]`. |
+
+### Walk-forward parameters
+
+| Variable | Default | Description |
+|---|---|---|
+| `TRAIN_DAYS` | `252L` | **[OPT-4]** Training window size per fold in trading days (~1 year). |
+| `PRED_DAYS` | `21L` | **[OPT-4]** Prediction horizon per fold in trading days (~1 month). |
+| `MIN_FOLDS` | `3L` | Minimum number of complete folds required. The script aborts with an informative error if fewer folds are available. |
+
+### GRU / training parameters
+
+| Variable | Default | Description |
+|---|---|---|
+| `GRU_UNITS` | `64L` | Units in the first GRU layer. Second layer uses `GRU_UNITS / 2 = 32`. |
+| `DROPOUT` | `0.20` | Dropout rate applied after each GRU layer. Disabled at inference (`training=FALSE`). |
+| `LR` | `1e-3` | Initial Adam learning rate. Decayed by `PATIENCE_LR` callback. |
+| `BATCH_SIZE` | `32L` | Mini-batch size. Must be integer. |
+| `EPOCHS` | `100L` | Maximum training epochs; early stopping typically terminates well before this. |
+| `PATIENCE_STOP` | `15L` | Early stopping patience (epochs without val_loss improvement). |
+| `PATIENCE_LR` | `7L` | LR reduction patience. When triggered, LR is halved (factor = 0.5). |
+| `L2_REG` | `1e-4` | L2 weight regularisation coefficient applied to both GRU kernel matrices. |
 
 ---
 
-### 5.3 Section 2 — Data Loading
+## 6. Data Requirements
 
-```r
-df      <- read_excel(DATA_PATH, sheet = SHEET_NAME)
-r_spx   <- diff(log(spx))          # SPX log returns, length N-1
-vix[-1]                             # VIX aligned to returns (Fix 1)
-log_returns <- diff(log(esg_raw))  # ESG log returns, length M-1
+### Input file
+
+```
+DATA_PATH <- "/kaggle/input/datasets/robertosnotetaker/base-vix-verde/Base Definitiva VIX Verde.xlsx"
 ```
 
-**Critical alignment fix:** the VIX series has one more observation than the return series. `vix[t]` is the VIX *closing level on the same day* as `r_spx[t]`, which is computed from `spx[t-1]` and `spx[t]`. Therefore `vix[-1]` (dropping the first observation) is passed to the likelihood, ensuring that `vix_obs[t]` and `returns[t]` correspond to the same calendar date.
+Adjust `DATA_PATH` to point to your local or cloud copy of the Excel file.
 
-**Pre-flight assertions** (`stopifnot`) verify:
-- `length(vix) == length(r_spx) + 1`
-- No `NA` values in any series
-- Return and VIX lengths match after alignment
+### Required columns
+
+| Column | Type | Description |
+|---|---|---|
+| `Date` | Date/POSIXct | Trading calendar dates. Used for alignment and plot axes. |
+| `SPX` | Numeric | S&P 500 closing price levels. Log-returns are computed internally. |
+| `VIX` | Numeric | CBOE VIX index (implied volatility, in index points). This is the training target. |
+| `Price (Adjusted BESG)` | Numeric | Adjusted ESG index price levels. Log-returns computed internally. |
+
+### Minimum data requirements
+
+| Series | Minimum length | Reason |
+|---|---|---|
+| SPX / VIX | `TRAIN_DAYS + PRED_DAYS × MIN_FOLDS + TIMESTEPS` ≈ 357 obs | To support at least `MIN_FOLDS = 3` walk-forward folds |
+| ESG | `TIMESTEPS + 1` = 21 obs | Minimum for one complete sequence (inference only) |
+
+The script enforces these with `stopifnot()` assertions that produce informative errors on failure.
+
+### Pre-processing performed by the script
+
+The following transformations are applied internally — you do **not** need to pre-process the raw price data:
+
+```r
+r_spx       <- diff(log(spx))          # SPX log-returns
+log_returns <- diff(log(esg_raw))      # ESG log-returns
+vix_aligned <- vix[2:length(vix)]      # VIX aligned to returns (drop first obs)
+```
 
 ---
 
-### 5.4 Section 3 — Affine Coefficients
+## 7. Function Reference
 
-```r
-vix_affine_coef <- function(omega, alpha, beta, gamma_star, T_H)
+### `FIT_GARCH(returns, label, garch_variant, dist, tol, delta)`
+
+Fits a GJR-GARCH(1,1) model via maximum likelihood estimation using `rugarch::ugarchfit()`.
+
+**Arguments:**
+
+| Argument | Default | Description |
+|---|---|---|
+| `returns` | — | Numeric vector of log-returns |
+| `label` | `"Series"` | Label string for console messages |
+| `garch_variant` | `GARCH_VARIANT` | `"gjrGARCH"` or `"eGARCH"` |
+| `dist` | `GARCH_DIST` | Error distribution |
+| `tol` | `GARCH_TOL` | Likelihood convergence tolerance |
+| `delta` | `GARCH_DELTA` | Hessian finite-difference step |
+
+**Returns:** Named list with:
+- `fit` — `uGARCHfit` S4 object from rugarch
+- `h_t` — Numeric vector of daily conditional **variances** (`sigma(fit)^2`)
+- `spec` — `uGARCHspec` specification object (reusable for forecasting)
+- `persistence` — Scalar: `α + γ/2 + β`
+
+**Solver fallback chain:**
+
+```
+hybrid [tol=1e-12] ──► nlminb [tol=1e-12] ──► solnp [loose tol]
 ```
 
-Runs the forward recursion for `τ = 1, …, T_H` and returns:
-
-- `sumA` = `Σ A(τ)` from `τ = 1` to `T_H`
-- `sumB` = `Σ B(τ)` from `τ = 1` to `T_H`
-- `phi_Q` = `β + α γ*²` (Q-measure persistence, checked `< 1`)
-
-The key implementation detail is the **order of operations**: propagate first (`A_new`, `B_new`), then accumulate into `sumA`, `sumB`. Accumulating before propagating would shift the sum by one period (the off-by-one error corrected in Fix 4).
+Each fallback fires only on `tryCatch` error from the preceding solver.
 
 ---
 
-### 5.5 Section 4 — Joint NLL Function
+### `APPLY_VAR_TRANSFORM(h, method)`
 
-```r
-joint_hn_nll <- function(params, returns, vix_obs, T_H, ann_factor, vix_weight)
-```
+Applies the configured variance feature transformation.
 
-**Parameter vector** `params[1:6]` = `{ω, α, β, γ, λ, σ_v}`.
+| `method` | Formula | Use case |
+|---|---|---|
+| `"sqrt"` | `f(h) = √h` | Moderate spikes; preserves volatility units |
+| `"log"` | `f(h) = log(h + ε)` | Strong linearisation; removes absolute scale |
+| `"none"` | `f(h) = h` | Passthrough (not recommended) |
 
-The function evaluates the negative joint log-likelihood:
+**Guard:** `log` mode adds `1e-12` before taking logs to prevent `log(0) = -Inf`.
 
-$$\text{NLL} = -\left(\mathcal{L}_{\text{SPX}} + w \cdot \mathcal{L}_{\text{VIX}}\right)$$
+---
 
-**SPX leg** (Gaussian conditional density):
+### `INVERT_VAR_TRANSFORM(fh, method)`
 
-$$\mathcal{L}_{\text{SPX}} = -\frac{1}{2}\sum_t \left[\ln h_t + \frac{(r_t - \lambda h_t)^2}{h_t}\right]$$
+Exact inverse of `APPLY_VAR_TRANSFORM`. Used for diagnostic back-transforms.
 
-**VIX leg** (log-VIX Gaussian measurement equation):
-
-$$\mathcal{L}_{\text{VIX}} = -\frac{1}{2}\sum_t \left[\ln \sigma_v^2 + \frac{(\ln \text{VIX}_t - \frac{1}{2}\ln \widehat{\text{VIX}}_t^2)^2}{\sigma_v^2}\right]$$
-
-The `log(VIX)` formulation is standard in the VIX options literature (Bardgett, Gourier & Leippold 2019) because it maps the positive-valued VIX to the real line and produces residuals that are empirically closer to Gaussian.
-
-**Penalty conditions** returning `1e10`:
-
-| Condition | Reason |
+| `method` | Inverse formula |
 |---|---|
-| `ω ≤ 0` or `α ≤ 0` or `β ≤ 0` or `σ_v ≤ 0` | Parameters must be strictly positive |
-| `β + αγ² ≥ 1` | Stationarity violation |
-| `φ_Q = β + αγ*² ≥ 1` | Q-measure affine recursion diverges |
-| `h ≤ 0` or `!is.finite(h)` | Variance collapse |
-| `vix2_hat ≤ 0` | Non-positive model VIX² |
-| `!is.finite(nll)` | Overflow/underflow |
+| `"sqrt"` | `h = fh²` |
+| `"log"` | `h = exp(fh) − ε` |
+| `"none"` | `h = fh` |
 
 ---
 
-### 5.6 Section 5 — SPX/VIX MLE
+### `SCALE_FIT(x)`
 
-Optimisation via `solnp` (Sequential Quadratic Programming, Ye 1987):
+Fits a Min-Max scaler on vector `x` and returns a closure list.
+
+**Returns:** Named list with:
+- `min`, `max` — Observed range
+- `transform(v)` — Maps `v` to `[0, 1]`: `(v − min) / (max − min + ε)`
+- `inverse(v)` — Exact inverse: `v × (max − min + ε) + min`
+
+The `ε = 1e-10` term prevents division by zero for constant series.
+
+---
+
+### `BUILD_SEQUENCES(X, y, timesteps)`
+
+Constructs the 3-D sliding-window tensor required by `layer_gru()`.
+
+**Algorithm:**
+
+```
+For i in 1 .. (nrow(X) - timesteps):
+    X_seq[i, , ] ← X[i : i + timesteps - 1, ]   # (T × F) input window
+    y_seq[i]     ← y[i + timesteps]               # next-step scalar target
+```
+
+**Returns:**
+- `X` — 3-D array `(n_samples, timesteps, n_features)`, dtype `double`
+- `y` — Numeric vector `(n_samples,)`
+- `n` — Integer count of valid samples
+
+**Edge case:** Returns `list(X=NULL, y=NULL, n=0L)` if `nrow(X) <= timesteps`.
+
+---
+
+### `BUILD_GRU_MODEL(timesteps, n_features, units, dropout, lr, l2)`
+
+Constructs and compiles a stacked GRU model using the keras3 functional API.
+
+**Architecture:**
+
+```
+Input (TIMESTEPS, N_FEATURES)
+  └─► GRU(64, return_sequences=TRUE, L2=1e-4)    [GRU layer 1]
+        └─► Dropout(0.20)
+              └─► GRU(32, return_sequences=FALSE, L2=1e-4)  [GRU layer 2]
+                    └─► Dropout(0.20)
+                          └─► Dense(16, activation="relu")
+                                └─► Dense(1, activation="linear")   [VIX output]
+```
+
+**GRU gate equations (per timestep):**
+
+```
+r_t = σ(W_r · [h_{t-1}, x_t] + b_r)          # reset gate
+z_t = σ(W_z · [h_{t-1}, x_t] + b_z)          # update gate
+ñ_t = tanh(W_n · [r_t ⊙ h_{t-1}, x_t] + b_n) # candidate hidden state
+h_t = (1 − z_t) ⊙ h_{t-1} + z_t ⊙ ñ_t       # new hidden state
+```
+
+**Compiled with:**
+- Optimizer: Adam (`lr = 1e-3`)
+- Loss: Mean Squared Error
+- Metrics: Mean Absolute Error
+
+**Note:** `keras::compile()` mutates the model in-place and returns `NULL` in keras3. The function explicitly returns the model object after calling compile.
+
+---
+
+### `GRU_INFER(model, X)`
+
+Runs inference on a trained GRU model. keras3-compatible replacement for the removed `keras::predict()` generic.
 
 ```r
-opt_result <- solnp(
-  pars    = params_init,
-  fun     = joint_hn_nll,
-  ineqfun = ineq_fun,      # g(θ) = β + αγ²
-  ineqLB  = 1e-9,
-  ineqUB  = 1 - 1e-6,
-  LB      = lb,
-  UB      = ub,
-  ...
+GRU_INFER <- function(model, X) {
+  tensor <- tensorflow::tf$constant(X, dtype = "float32")
+  as.vector(as.array(model(tensor, training = FALSE)))
+}
+```
+
+`training = FALSE` is critical: it disables Dropout during inference. Without it, predictions are stochastic across calls.
+
+---
+
+## 8. Pipeline Steps
+
+The script executes nine numbered stages, logged to console as `[N/9]`.
+
+### Step 1 — Data loading `[1/9]`
+
+Reads the Excel file, extracts the four raw series, computes log-returns via `diff(log(.))`, and aligns VIX to the return series (shifting by 1 to drop the observation lost by `diff()`).
+
+**Key assertion:**
+```r
+stopifnot(length(r_spx) == length(vix_aligned))
+stopifnot(length(log_returns) >= TRAIN_DAYS + PRED_DAYS + TIMESTEPS)
+```
+
+### Step 2 — SPX GJR-GARCH fit `[2/9]`
+
+Fits GJR-GARCH(1,1) on the full SPX log-return series `r_spx`. Extracts `h_spx_raw` (daily conditional variance) and reports the persistence diagnostic.
+
+### Step 3 — Variance feature transform `[3/9]`
+
+Applies `APPLY_VAR_TRANSFORM(h_spx_raw)` to produce `fh_spx`. Reports skewness before and after to confirm linearisation. Fits Min-Max scalers `scaler_r_spx`, `scaler_fh_spx`, `scaler_vix` on the full SPX series.
+
+### Step 4 — Walk-forward validation `[4/9]`
+
+Executes the rolling-window GRU training loop. See [Section 9](#9-walk-forward-validation-protocol) for full protocol details.
+
+### Step 5 — Final GRU refit `[5/9]`
+
+After walk-forward evaluation, trains a fresh GRU on the **entire** SPX series (90% train / 10% internal validation). This is the model that will be used for ESG transfer. Early stopping and LR decay are active.
+
+### Step 6 — ESG GJR-GARCH fit `[6/9]`
+
+Fits the same GJR-GARCH specification (including `GARCH_DIST`, `GARCH_TOL`, `GARCH_DELTA`) on `log_returns`. Extracts `h_esg_raw` and reports ESG persistence.
+
+### Step 7 — Transfer inference `[7/9]`
+
+Applies `APPLY_VAR_TRANSFORM` to `h_esg_raw`, normalises using the SPX scalers, reshapes into 3-D sequences, and calls `GRU_INFER(final_gru, X_esg_tensor)`. Inverse-transforms the output using `scaler_vix$inverse()`. See [Section 10](#10-transfer-learning-mechanism) for design rationale.
+
+### Step 8 — Plots and outputs `[8/9]`
+
+Resolves `OUTPUT_DIR`, writes all seven PNG plots and four CSV files, attempts model save with three-level fallback.
+
+### Step 9 — Verification `[9/9]`
+
+Checks existence and file size of every expected output, prints the full performance summary table, and raises a `warning()` if any file is missing.
+
+---
+
+## 9. Walk-Forward Validation Protocol
+
+### Motivation
+
+A static 80/20 chronological split (as used in v1) has a critical flaw for financial time series: the single test window may coincide with an unusually calm or unusually volatile period, making the reported metrics non-representative of general performance. Walk-forward validation provides a distribution of OOS errors across multiple market regimes.
+
+### Rolling window design
+
+```
+|←──── TRAIN_DAYS ────→|←─ PRED_DAYS ─→|
+ Fold 1:  [1 ............. 252 | 253 ... 273]
+ Fold 2:  [22 ............ 273 | 274 ... 294]   (window rolls by PRED_DAYS)
+ Fold 3:  [43 ............ 294 | 295 ... 315]
+ ...
+```
+
+- Window type: **fixed-size rolling** (not expanding). The training window size stays constant at `TRAIN_DAYS`. This ensures each fold sees the same volume of recent history.
+- Step size: `PRED_DAYS` (21 trading days). The window rolls by one prediction horizon per fold.
+- Total folds: `floor((n_total_seq − TRAIN_DAYS) / PRED_DAYS)`
+
+### Per-fold training
+
+For each fold `k`:
+
+1. Extract tensor slices for training (`TRAIN_DAYS` sequences) and prediction (`PRED_DAYS` sequences) windows.
+2. Reserve the last 15% of the training window as an internal validation set for early stopping.
+3. Call `BUILD_GRU_MODEL()` — weights initialised from scratch.
+4. Train with callbacks: `EarlyStopping(patience=15)` + `ReduceLROnPlateau(factor=0.5, patience=7)` + `ModelCheckpoint`.
+5. Run `GRU_INFER()` on the prediction window.
+6. Collect OOS predictions and compute fold-level RMSE, MAE, R².
+7. Destroy the fold model and call `keras::k_clear_session()` + `gc()` to release GPU/CPU memory.
+
+### Fine-tuning alternative
+
+The script includes a commented block explaining how to replace step 3 with **warm-start fine-tuning**: instead of building a fresh model, restore weights from the previous fold's checkpoint and reduce LR by 10×. This is recommended when:
+- The total dataset is short (< 500 trading days).
+- Regimes are slow-moving (e.g., emerging market indices).
+
+---
+
+## 10. Transfer Learning Mechanism
+
+### The cross-domain normalisation assumption
+
+The GRU learns the function:
+
+```
+f : [r̃_t, f̃(h_t)] → VIX̃_t
+```
+
+where tildes denote Min-Max-scaled values. The scaler parameters (min, max) are fitted on the full **SPX** series.
+
+When ESG features are fed into the same model, they are scaled using the **same SPX scaler parameters**:
+
+```r
+esg_r_scaled  <- scaler_r_spx$transform(log_returns)
+esg_fh_scaled <- scaler_fh_spx$transform(fh_esg)
+```
+
+This is the operationalisation of the universal mechanism hypothesis: we assert that, in the normalised space `[0, 1]²`, the mapping to implied volatility is the same for SPX and ESG. If ESG returns or conditional SD fall outside the SPX training range, they will clip to values outside `[0, 1]` — a natural indicator that the transfer assumption is being stressed.
+
+### Why this works (theoretical justification)
+
+The variance feature transform `f(h_t) = √h_t` maps both series to conditional SD, which is the natural unit of volatility. After this transform, the Min-Max scaler maps both to the same relative position within their empirical volatility regime. The GRU then maps relative volatility level and recent returns to a relative implied volatility level, which the VIX inverse-scaler maps back to index points.
+
+The validity of this approach rests on two assumptions:
+1. The **rank ordering** of volatility regimes (calm / normal / stressed) is preserved across the two domains.
+2. The VIX scaler range covers the range of synthetic VIX values the ESG index would plausibly produce.
+
+If (2) is violated — e.g., the ESG index is systematically more volatile than SPX — the synthetic VIX will be clipped. In that case, fit a separate VIX scaler calibrated to the ESG domain's expected range.
+
+---
+
+## 11. Output Files
+
+All files are written to `OUTPUT_DIR`, which resolves as:
+
+| Environment | Path |
+|---|---|
+| Kaggle Notebook | `/kaggle/working` |
+| Custom override | `getOption("output_dir")` |
+| Local / other | `getwd()` (current working directory) |
+
+### CSV outputs
+
+| File | Columns | Description |
+|---|---|---|
+| `synthetic_vix_esg.csv` | `Date`, `Synthetic_VIX` | **Primary deliverable.** Daily synthetic VIX for the ESG index. |
+| `walkforward_oos_predictions.csv` | `Date`, `Fold`, `Actual_VIX`, `Pred_VIX` | OOS predictions from the walk-forward loop, labelled by fold. |
+| `walkforward_fold_metrics.csv` | `fold`, `train_start`, `train_end`, `pred_start`, `pred_end`, `best_epoch`, `val_mse`, `oos_rmse`, `oos_mae`, `oos_r2` | Per-fold performance summary. |
+| `spx_full_sample_fit.csv` | `Date`, `Actual`, `Predicted` | Final GRU full-sample fit on the SPX domain. |
+
+### PNG plots
+
+| File | Content |
+|---|---|
+| `01_walkforward_fold_metrics.png` | Bar chart of OOS RMSE per fold with aggregate RMSE reference line. |
+| `02_walkforward_oos_fit.png` | Time series of actual vs. predicted CBOE VIX across all OOS fold windows, with alternating fold shading. |
+| `03_final_gru_training_history.png` | Train and validation MSE curves for the final GRU (full SPX refit). |
+| `04_spx_full_gru_fit.png` | Full-sample SPX actual vs. GRU-fitted VIX. |
+| `05_synthetic_vix_esg.png` | Synthetic VIX time series for the ESG index with ±15% shaded band. |
+| `06_spx_garch_vol_transform.png` | Two-panel: (top) annualised SPX conditional volatility; (bottom) same series after variance transform. Requires `gridExtra`; falls back to top panel only. |
+| `07_esg_garch_vol.png` | Annualised ESG conditional volatility from GJR-GARCH. |
+
+### Model file
+
+| File | Format | Description |
+|---|---|---|
+| `gjr_garch_gru_model.keras` | Native keras3 format | Full model: architecture + weights + optimizer state. Load with `keras::load_model()`. |
+| `gjr_garch_gru_weights.*` | TF SavedModel weights | Fallback if full-model save fails. Requires architecture to be rebuilt before loading. |
+
+---
+
+## 12. Performance Metrics
+
+The following metrics are computed and reported at multiple levels.
+
+### Walk-forward OOS metrics (primary evaluation)
+
+Computed by concatenating all fold OOS predictions:
+
+```
+RMSE = √( mean( (VIX_pred - VIX_actual)² ) )
+MAE  =   mean( |VIX_pred - VIX_actual| )
+R²   = 1 - SS_res / SS_tot
+```
+
+All values are in **VIX index points** (after inverse-scaling from `[0, 1]`).
+
+### Per-fold metrics
+
+Each fold reports its own RMSE, MAE, and R², along with `best_epoch` (early stopping epoch) and `val_mse` (internal validation MSE). These are written to `walkforward_fold_metrics.csv` and plotted in `01_walkforward_fold_metrics.png`.
+
+Persistent regression across folds (rising RMSE) indicates non-stationary regime evolution that the 252-day window may not be capturing — consider increasing `TRAIN_DAYS` or switching to fine-tuning mode.
+
+### Final GRU full-sample metrics
+
+Reported separately as in-sample metrics on the final model trained on the full SPX history. These will be optimistic relative to the walk-forward OOS metrics; the walk-forward metrics are the scientifically valid evaluation.
+
+### GARCH persistence diagnostic
+
+```
+α + γ/2 + β < 1   →  covariance-stationary process
+α + γ/2 + β = 1   →  integrated GARCH (I-GARCH): infinite variance persistence
+α + γ/2 + β > 1   →  explosive process (ill-specified model)
+```
+
+Values above 0.97 are common for daily equity returns and do not indicate a problem; values ≥ 1.0 trigger a `warning()`.
+
+---
+
+## 13. Methodological Optimizations (v1 → v2)
+
+This section documents the four changes introduced in v2, their academic rationale, and their practical implementation.
+
+### [OPT-1] GRU replaces LSTM
+
+**What changed:** `layer_lstm()` replaced with `layer_gru()` throughout.
+
+**Why:**
+
+LSTM has four gate matrices per layer (input, forget, output gates + cell-state candidate). GRU merges forget and input into a single update gate, eliminating the separate cell state. This gives GRU approximately 25% fewer parameters for the same hidden unit count.
+
+For financial time series with low signal-to-noise ratio (~0.05–0.15) and limited per-fold samples (~200–250 sequences per fold), the capacity reduction acts as implicit regularisation. LSTM's additional parameters increase the risk of memorising noise patterns in individual regimes, which is especially damaging in walk-forward mode where each fold sees a different market environment.
+
+**Parameter count comparison at 64/32 units, 2 features:**
+
+| Model | Layer 1 params | Layer 2 params | Total |
+|---|---|---|---|
+| LSTM | 4×(64×2 + 64×64 + 64) = 17,664 | 4×(32×64 + 32×32 + 32) = 12,416 | 30,080 |
+| GRU  | 3×(64×2 + 64×64 + 64) = 13,248 | 3×(32×64 + 32×32 + 32) = 9,312  | 22,560 |
+
+GRU uses ~25% fewer parameters.
+
+---
+
+### [OPT-2] Variance feature transformation
+
+**What changed:** `h_t` is passed through `APPLY_VAR_TRANSFORM()` before Min-Max scaling.
+
+**Why:**
+
+Raw conditional variance `h_t` from GJR-GARCH is heavy-tailed and right-skewed. During crisis periods (e.g., March 2020, October 2008), `h_t` spikes to 50–100× its long-run mean. Feeding raw `h_t` into Min-Max scaling creates two problems:
+
+1. The scaler range is dominated by one or two extreme observations, compressing all non-crisis variation into the bottom 1–2% of `[0, 1]`.
+2. The neural network sees near-identical inputs for all non-crisis days, destroying the discriminative power of the variance feature.
+
+The `sqrt` transform (default) maps the tail exponent from ~4 (typical for squared daily returns) to ~2, similar to a normal distribution. The `log` transform maps multiplicative shocks to additive ones, analogous to the log-variance parameterisation in eGARCH.
+
+**Skewness reduction example (typical SPX data):**
+
+| Series | Skewness |
+|---|---|
+| Raw `h_t` | ~15–40 (extreme right skew) |
+| `sqrt(h_t)` | ~3–5 (moderate right skew) |
+| `log(h_t)` | ~0.5–1.5 (near-symmetric) |
+
+---
+
+### [OPT-3] Tightened GARCH solver tolerances
+
+**What changed:** `solver.control = list(tol = 1e-12, delta = 1e-11)`.
+
+**Why:**
+
+The default `rugarch` convergence tolerance is `1e-8`. For GJR-GARCH models on daily equity returns with persistence near 0.97–0.99, the log-likelihood surface is extremely flat in the `β` direction — moving `β` by ±0.005 changes the log-likelihood by less than 0.001. The default tolerance allows the hybrid solver to declare convergence when still several gradient steps from the true MLE.
+
+This systematically biases the estimated parameters: `β` is underestimated and `α` is overestimated, producing conditional variance paths that over-react to recent shocks and under-weight the long-run component. The tighter tolerances force the solver to continue until the gradient norm is genuinely negligible.
+
+The `delta` parameter controls the finite-difference step used to compute the numerical Hessian for standard errors. The default is also loose; the tighter value produces more accurate standard errors, which matters if you use the GARCH fit for formal hypothesis testing.
+
+---
+
+### [OPT-4] Walk-forward validation
+
+**What changed:** Static 80/20 chronological split replaced by rolling-window walk-forward protocol.
+
+**Why:**
+
+The static split evaluates performance on a single contiguous test period. If that period happens to be a calm (or crisis) regime unrepresentative of the full history, the RMSE metric is misleading. Walk-forward validation distributes the evaluation across multiple non-overlapping prediction windows, providing:
+
+1. An empirical distribution of OOS error (mean, variance, worst-case fold).
+2. Evidence about regime-specific performance — did the model fail during high-VIX periods?
+3. Honest generalisation error, since each fold's GRU is tested on data that was never used in its training window.
+
+The **regime-adaptive retraining** (fresh GRU per fold) ensures the model weights reflect the current volatility regime rather than accumulating gradients from remote historical periods. This is especially important for the SPX→ESG transfer: if the most recent fold learned weights calibrated to a post-COVID low-vol regime, those weights are more likely to produce sensible ESG synthetic VIX values than weights calibrated to a 2008 crisis regime.
+
+---
+
+## 14. Error Handling & Fallback Chains
+
+### GARCH solver fallback
+
+```
+Primary:   hybrid [tol=1e-12, delta=1e-11]
+           ↓ (on error)
+Fallback 1: nlminb [tol=1e-12, delta=1e-11]
+           ↓ (on error)
+Fallback 2: solnp [default tolerances]
+```
+
+`solnp` is always available and does not use gradient-based convergence criteria, making it a reliable last resort at the cost of potentially looser parameter estimates.
+
+### Model save fallback
+
+```
+Primary:   keras::save_model()     (keras3 >= 3.3)
+           ↓ (on error: not exported)
+Fallback 1: keras$saving$save_model()   (Python passthrough, always available)
+           ↓ (on error)
+Fallback 2: keras::save_model_weights_tf()  (weights only; requires architecture rebuild to reload)
+```
+
+### Output directory fallback
+
+```
+if /kaggle/working exists  → /kaggle/working
+elif getOption("output_dir") set → that path
+else → getwd()
+```
+
+### Walk-forward data guard
+
+```r
+if (pred_end_idx > n_total_seq) break
+```
+
+If the final fold's prediction window would exceed the available data, the loop exits cleanly rather than throwing an array out-of-bounds error. The metrics up to the last complete fold are still reported.
+
+---
+
+## 15. Extending the Pipeline
+
+### Changing the variance transform
+
+Set `VAR_TRANSFORM <- "log"` for maximum linearisation (recommended when the ESG index has extreme crisis behaviour). Set `"none"` to reproduce v1 behaviour for comparison.
+
+### Switching to eGARCH
+
+```r
+GARCH_VARIANT <- "eGARCH"
+```
+
+eGARCH parameterises `log(h_t)` directly and therefore does not require the variance feature transform for gradient stability (the transform is still applied, but `log(log(h_t))` will be used if `VAR_TRANSFORM = "log"` — this is redundant and should be set to `"none"` when using eGARCH).
+
+### Adding more features
+
+To add a third feature (e.g., 5-day rolling realised variance `rv_t`):
+
+```r
+N_FEATURES <- 3L
+scaler_rv   <- SCALE_FIT(rv_spx)
+X_spx_scaled <- cbind(
+  scaler_r_spx$transform(r_spx),
+  scaler_fh_spx$transform(fh_spx),
+  scaler_rv$transform(rv_spx)
 )
 ```
 
-**Starting values:**
+Update `BUILD_GRU_MODEL()` input shape automatically via `n_features = dim(X_train)[3]`.
 
-| Parameter | `params_init` | Rationale |
-|---|---|---|
-| `ω` | `1e-6` | Order of daily variance intercept on decimal returns |
-| `α` | `1e-6` | ARCH term tiny in decimal scale |
-| `β` | `0.90` | Typical GARCH persistence for equity |
-| `γ` | `100` | Large because `√h_t ≈ 0.01`, so `γ√h_t ≈ 1` |
-| `λ` | `2.0` | Modest positive variance risk premium |
-| `σ_v` | `0.10` | Log-VIX noise ~10% |
+### Expanding vs. rolling window
 
-**Lower bound rationale (gradient collapse prevention):**
-
-Setting `lb = 0` for `ω` or `α` causes the unconditional variance `h̄ = (ω + α)/(1 - β - αγ²)` to collapse toward zero. At that point `log(h) → -∞` and `∂L/∂ω → ∞`, making the gradient undefined at the boundary. The bounds `lb(ω) = lb(α) = 1e-9` keep the optimiser five orders of magnitude below typical values while imposing no economically meaningful constraint (an annualised volatility floor of `0.016%`).
-
-**Post-estimation derived quantities:**
+To use an **expanding window** instead of rolling (train on all history up to fold k):
 
 ```r
-stat_measure   <- beta_hat + alpha_hat * gamma_hat^2     # stationarity LHS
-h_uncond_hat   <- (omega_hat + alpha_hat) / (1 - stat_measure)
-gamma_star_hat <- gamma_hat + lambda_hat + 0.5           # risk-neutral leverage
-phi_Q          <- beta_hat + alpha_hat * gamma_star_hat^2
+train_start_idx <- 1L   # always start from the beginning
+train_end_idx   <- TRAIN_DAYS + (k - 1L) * PRED_DAYS
 ```
 
----
+Expanding windows accumulate more data per fold but may slow learning in non-stationary environments because early regime data dilutes recent signal.
 
-### 5.7 Section 6 — SPX Diagnostic Plots
+### Fine-tuning (warm-start) across folds
 
-Four `ggplot2` panels saved to `hn_garch_spx_diagnostics.png`:
-
-| Panel | Content |
-|---|---|
-| `p1` | Observed vs. model-implied VIX (time series) |
-| `p2` | Physical conditional volatility `√(h_t · 252) × 100` |
-| `p3` | VIX pricing error with ±RMSE bands |
-| `p4` | Scatter: model vs. observed VIX |
-
----
-
-### 5.8 Section 7 — ESG Physical MLE
-
-**Five-parameter NLL** — `λ_ESG` is estimated freely (not fixed to zero):
+Replace the per-fold `BUILD_GRU_MODEL()` call with:
 
 ```r
-nll_esg <- function(params, returns)
-# params = {omega, alpha, beta, gamma, lambda_esg}
-```
-
-Rationale: fixing `λ = 0` biases the conditional mean equation, which can absorb variation that should be attributed to the variance parameters. Estimating `λ_ESG` freely as a physical drift parameter produces unbiased `{ω, α, β, γ}` estimates. Critically, `λ_ESG` does **not** enter the risk-neutral transformation — that uses `λ_SPX` exclusively.
-
-**Risk-neutral transformation:**
-
-```r
-gamma_star_esg <- gamma_esg + lambda_spx + 0.5
-```
-
-`lambda_spx` was carried forward from the SPX/VIX joint MLE as `lambda_hat`.
-
----
-
-### 5.9 Section 8 — ESG P-Measure Filter
-
-```r
-for (t in seq_along(log_returns)) {
-  h_path_esg[t] <- h_curr
-  z_t    <- log_returns[t] / sqrt(h_curr)
-  h_curr <- omega_esg + beta_esg * h_curr +
-            alpha_esg * (z_t - gamma_esg * sqrt(h_curr))^2
-}
-```
-
-This produces the **P-measure conditional variance path** `h_path_esg[t]`. The filter uses the physical-measure innovation `z_t = r_t / √h_t` (mean zero because `λ = 0` is a valid approximation for the filter, or the estimated `λ_ESG` can be incorporated without affecting the theoretical validity).
-
-**Key design note:** passing the P-measure filtered `h_t` as `h0` into the Q-measure option pricer is **theoretically correct**. The current variance state is a physical observable — it is the same value regardless of which measure is used for pricing. The measure change only affects the drift and leverage; the current state `h_t` is invariant.
-
----
-
-### 5.10 Section 9 — CBOE Variance Formula
-
-```r
-cboe_variance <- function(K_grid, Q_grid, T, R, F, K0)
-```
-
-Exact implementation of the CBOE White Paper formula. The `delta_K` edge treatment uses one-sided differences at the two boundary strikes, matching the CBOE specification precisely. For a uniform grid the interior central differences are constant, but the edge correction is non-trivial and must be coded explicitly.
-
----
-
-### 5.11 Section 10 — Strike Grid Builder
-
-```r
-build_otm_grid <- function(S_t, h_t, T_years, R_annual)
-```
-
-**Steps:**
-
-1. Generate `K_grid = S_t × m_grid` where `m_grid` spans `[0.01, 2.01]` uniformly
-2. Compute forward `F_t = S_t · exp(R · T)` and find `K0_idx`
-3. Call `hn_option_strip(K_grid, ...)` once for puts and once for calls — **vectorised C++ call**, no R loop over strikes
-4. Apply OTM selection rule at each strike
-5. Apply two-consecutive tail truncation from each wing
-6. Return `list(K_grid, Q_grid, F, K0)` with truncated strikes only
-
-**Moneyness grid design:** the domain `[0.01, 2.01]` with 150 strikes gives a constant spacing of `Δm ≈ 0.0134`, corresponding to `ΔK ≈ 0.0134 × S_t`. For `S_t = 100`, this is `ΔK ≈ 1.34` — fine enough to accurately integrate the volatility surface from deep OTM puts to deep OTM calls.
-
----
-
-### 5.12 Section 11 — Parallelised Daily VIX Loop
-
-The daily VIX computation is **embarrassingly parallel**: each day `t` depends only on `(S_t, h_t)` and the fixed model parameters. The `vix_one_day` function is fully self-contained, embedding its own copies of the grid builder and CBOE formula as inner closures.
-
-**Platform dispatch:**
-
-```r
-if (.Platform$OS.type == "windows") {
-  cl <- parallel::makeCluster(N_CORES)
-  parallel::clusterExport(cl, ...)
-  parallel::clusterEvalQ(cl, { library(Rcpp); sourceCpp("hn_pricer.cpp") })
-  # parLapply ...
-  parallel::stopCluster(cl)
+if (k == 1L) {
+  gru_fold <- BUILD_GRU_MODEL()
 } else {
-  # mclapply (fork-based, inherits parent environment)
+  gru_fold <- keras::load_model(prev_ckpt_path)
+  # Reduce LR by 10x for fine-tuning
+  keras::compile(gru_fold,
+    optimizer = keras::optimizer_adam(learning_rate = LR / 10),
+    loss = "mean_squared_error",
+    metrics = list("mean_absolute_error"))
 }
 ```
 
-**Windows PSOCK cluster:** PSOCK workers are blank R processes with no inherited state. Every object required by `vix_one_day` must be explicitly exported via `clusterExport`. Additionally, each worker must recompile `hn_pricer.cpp` via `clusterEvalQ` because the compiled C++ functions are not serialisable across process boundaries.
+### Reloading the saved model
 
-**Unix/macOS fork:** `mclapply` uses `fork()` which copies the entire parent memory space. The compiled C++ functions are present in the child processes without any re-export or recompilation.
-
----
-
-### 5.13 Section 12 — ESG Output
-
-Three output files are written:
-
-**`hn_garch_esg_diagnostics.png`** — two-panel plot:
-- ESG synthetic VIX time series
-- ESG physical conditional volatility
-
-**`esg_synthetic_vix.csv`** — daily output table:
-
-| Column | Description |
-|---|---|
-| `Date` | Trading date |
-| `VIX_ESG` | GreenVIX level (rounded to 6 d.p.) |
-| `Vol_ESG` | Annualised physical volatility `%` |
-| `h_t` | Raw conditional variance (10 d.p.) |
-
-**`hn_garch_esg_results.rds`** — full R list containing all parameters and arrays for downstream use.
+```r
+final_gru <- keras::load_model(
+  file.path(OUTPUT_DIR, "gjr_garch_gru_model.keras")
+)
+# Re-run transfer inference:
+synth_vix_scaled <- GRU_INFER(final_gru, X_esg_tensor)
+```
 
 ---
 
-## 6. Parameter Reference
+## 16. Known Limitations
 
-### SPX/VIX Parameters `{ω, α, β, γ, λ, σ_v}`
+**Transfer validity depends on regime overlap.** If the ESG index was launched during a period not represented in the SPX training data, the GRU will extrapolate outside its training distribution. Always inspect plot `06_spx_garch_vol_transform.png` to confirm that the ESG conditional SD range is covered by the SPX training range.
 
-| Symbol | Name | Typical range (decimal returns) | Interpretation |
-|---|---|---|---|
-| `ω` | Variance intercept | `1e-7` to `1e-5` | Long-run variance floor |
-| `α` | ARCH coefficient | `1e-7` to `1e-5` | Sensitivity to recent shocks |
-| `β` | GARCH coefficient | `0.85` to `0.98` | Variance persistence |
-| `γ` | Physical leverage | `50` to `300` | Asymmetry; large on decimal scale because `√h_t ≈ 0.01` |
-| `λ` | Variance risk premium | `1.0` to `5.0` | Compensation for holding variance risk |
-| `σ_v` | VIX noise std dev | `0.05` to `0.30` | Log-VIX measurement error |
+**No option pricing.** The synthetic VIX produced is a neural-network-predicted *implied volatility index*, not a model-consistent implied volatility surface. It cannot be used directly for option pricing without additional calibration.
 
-### ESG Parameters `{ω, α, β, γ}` + borrowed `λ_SPX`
+**Single-step ahead.** The sequence builder uses a many-to-one configuration with a single next-day target. Multi-step forecasting (e.g., a 5-day VIX term structure) would require a seq-to-seq architecture.
 
-Same interpretation as above but calibrated to ESG return dynamics. `λ_SPX` is not re-estimated.
+**Scale mismatch risk.** If the ESG index is systematically 2–3× more volatile than SPX (common for small-cap or sector ESG indices), the SPX VIX scaler's inverse transform will produce synthetic VIX values that are clipped at the SPX maximum. Inspect the output range and compare to `scaler_vix$max`.
 
-### Derived Risk-Neutral Parameters
+**Memory in walk-forward loop.** `BUILD_SEQUENCES()` is called inside each fold iteration, which reconstructs the full sequence tensor `(N−T, T, 2)` every fold. For very large datasets this is redundant. Refactor by calling `BUILD_SEQUENCES()` once before the loop and slicing the result inside the loop.
 
-| Symbol | Formula | Description |
-|---|---|---|
-| `γ*` | `γ + λ + 0.5` | Q-measure leverage |
-| `φ_Q` | `β + α(γ*)²` | Q-measure variance persistence (must be `< 1`) |
-| `γ*_ESG` | `γ_ESG + λ_SPX + 0.5` | ESG Q-measure leverage |
+**Stationarity assumption.** Both the GARCH model and the GRU are estimated under the implicit assumption that the data-generating process is stationary (or at least locally stationary within each fold window). Structural breaks (e.g., a permanent regime change in ESG index composition) violate this assumption.
 
 ---
 
-## 7. Calibration Constraints
+## 17. References
 
-| Constraint | Type | Enforcement |
-|---|---|---|
-| `ω > 0` | Box lower bound | `LB[1] = 1e-9` |
-| `α > 0` | Box lower bound | `LB[2] = 1e-9` |
-| `β > 0` | Box lower bound | `LB[3] = 1e-6` |
-| `β + αγ² < 1` | Inequality | `ineqfun`, `ineqUB = 1 - 1e-6` |
-| `σ_v > 0` | Box lower bound | `LB[6] = 1e-6` |
-| `φ_Q < 1` | Penalty `1e10` | Inside NLL function |
-| `h_t > 0` ∀t | Penalty `1e10` | Inside NLL loop |
+Cerqueira, V., Torgo, L., & Mozetič, I. (2020). Evaluating time series forecasting models: An empirical study on performance estimation methods. *Machine Learning*, 109, 1997–2028.
 
-The gap `1 - 1e-6` in `ineqUB` prevents the SQP solver's augmented-Lagrangian penalty from evaluating the log-likelihood at a unit-root parameter vector, where `h̄` is infinite.
+Cho, K., van Merrienboer, B., Gulcehre, C., Bahdanau, D., Bougares, F., Schwenk, H., & Bengio, Y. (2014). Learning phrase representations using RNN encoder-decoder for statistical machine translation. *arXiv:1406.1078*.
+
+Glosten, L. R., Jagannathan, R., & Runkle, D. E. (1993). On the relation between the expected value and the volatility of the nominal excess return on stocks. *Journal of Finance*, 48(5), 1779–1801.
+
+Heston, S. L., & Nandi, S. (2000). A closed-form GARCH option valuation model. *Review of Financial Studies*, 13(3), 585–625.
+
+Ruan, Q., Zhang, S., & Luo, C. (2022). A universal volatility formation mechanism: Transfer learning for implied volatility forecasting. *International Review of Financial Analysis*, 84, 102385.
 
 ---
 
-## 8. Data Requirements
-
-- All returns must be in **decimal form** (e.g. `0.012` for 1.2%). Percentage-form data will produce parameters that are wrong by factors of 10,000 and will likely cause the optimiser to fail at the starting values.
-- VIX must be in **raw index units** (e.g. `18.5`), not decimal volatility.
-- ESG prices must be **adjusted** for dividends and splits. The column `Price (Adjusted BESG)` is expected.
-- The three series (SPX, VIX, ESG) need not have identical length but must share a common date range after inner-joining on `Date`.
-- No `NA` values are tolerated. Pre-clean the input data.
-
----
-
-## 9. Outputs
-
-| File | Format | Contents |
-|---|---|---|
-| `hn_garch_spx_results.rds` | R list | All SPX/VIX MLE parameters + fit statistics |
-| `hn_garch_esg_results.rds` | R list | All ESG parameters + VIX series + variance path |
-| `esg_synthetic_vix.csv` | CSV | Daily GreenVIX, physical vol, `h_t` |
-| `hn_garch_spx_diagnostics.png` | PNG (14×10 in, 180 dpi) | 4-panel SPX fit diagnostic |
-| `hn_garch_esg_diagnostics.png` | PNG (14×8 in, 180 dpi) | 2-panel ESG VIX diagnostic |
-
----
-
-## 10. Design Decisions and Known Limitations
-
-### Why `solnp` and not `optim`?
-
-`optim` with `method = "L-BFGS-B"` cannot handle nonlinear inequality constraints. The stationarity condition `β + αγ² < 1` is nonlinear in the parameters and cannot be expressed as a box constraint. `solnp` implements a full SQP method that handles both box and general inequality constraints simultaneously.
-
-### Why Gil-Pelaez and not a finite-difference PDE?
-
-The HN-GARCH model is affine, meaning the characteristic function is available in closed form. The Gil-Pelaez inversion is exact (up to quadrature error) and requires no spatial grid, no boundary condition tuning, and no time-stepping stability analysis. For the problem at hand (150 strikes × 2 maturities × N days) it is both faster and more accurate than a PDE approach.
-
-### Why borrow `λ_SPX` for the ESG index?
-
-`λ` is the **market price of variance risk** — the compensation investors demand for being exposed to volatility fluctuations. This is a market-wide quantity, not an asset-specific one. An ESG index is a sub-portfolio of the equity market and is exposed to the same aggregate variance risk factor. There is no traded ESG variance market from which to estimate an independent `λ_ESG`, making the transplant methodology the only economically coherent approach.
-
-### Limitations
-
-- The physical-measure filter initialises at the unconditional variance `h̄`. For short samples or at the start of a crisis, this introduces a burn-in bias of approximately 50–100 observations.
-- The C++ CF recursion converts `T_years` to trading days by `round(T × 252)`. For maturities that are not multiples of `1/252`, there is a rounding error of up to half a trading day.
-- The parallelised loop reprices all 150 strikes × 2 maturities from scratch every day. If `N` is large (> 2,000 days), pre-computing the option surface and caching it will substantially reduce runtime.
-- The moneyness grid `[0.01, 2.01]` is fixed. For extreme volatility regimes (e.g. `VIX > 60`), the OTM wings may need to be extended beyond `m = 2.01` to capture tail variance adequately.
-
----
-
-## 11. References
-
-- Heston, S. L., & Nandi, S. (2000). A closed-form GARCH option valuation model. *Review of Financial Studies*, 13(3), 585–625.
-- Bardgett, C., Gourier, E., & Leippold, M. (2019). Inferring volatility dynamics and risk premia from the S&P 500 and VIX markets. *Journal of Financial Economics*, 131(1), 3–26.
-- Gil-Pelaez, J. (1951). Note on the inversion theorem. *Biometrika*, 38(3–4), 481–482.
-- CBOE (2019). *Cboe Volatility Index: VIX White Paper*. Chicago Board Options Exchange.
-- Ye, Y. (1987). Interior algorithms for linear, quadratic, and linearly constrained non-linear programming. *Ph.D. Dissertation*, Stanford University. (basis for `Rsolnp`)
-- Ghalanos, A., & Theussl, S. (2015). *Rsolnp: General Non-Linear Optimization Using Augmented Lagrange Multiplier Method*. R package.
